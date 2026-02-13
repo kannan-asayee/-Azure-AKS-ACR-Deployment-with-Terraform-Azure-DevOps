@@ -1,0 +1,211 @@
+trigger:
+  branches:
+    include:
+    - rev02br
+
+variables:
+- group: Terraform-ACR-AKS
+
+stages:
+- stage: Deploy_Infrastructure
+  displayName: '🏗️ Stage 1: Create ACR + AKS'
+  jobs:
+  - job: Terraform_Deploy
+    displayName: 'Deploy Azure Infrastructure'
+    pool:
+      name: 'Default'  # CHANGED TO DEFAULT
+    steps:
+    - checkout: self
+    
+    - task: AzureCLI@2
+      displayName: '📦 Terraform Apply'
+      inputs:
+        azureSubscription: 'terraform-azure-wif'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        inlineScript: |
+          set -e
+          echo "========================================="
+          echo "🔧 Initializing Terraform..."
+          echo "========================================="
+          
+          # Get storage account access key
+          ACCESS_KEY=$(az storage account keys list \
+            --resource-group rg-terraform-state \
+            --account-name terraformazlabstate01 \
+            --query "[0].value" -o tsv)
+          
+          # Initialize backend
+          terraform init \
+            -backend-config="storage_account_name=terraformazlabstate01" \
+            -backend-config="container_name=terraform-state" \
+            -backend-config="key=aks-acr-$(ENVIRONMENT).tfstate" \
+            -backend-config="access_key=$ACCESS_KEY" \
+            -reconfigure
+          
+          echo "========================================="
+          echo "🏗️ Creating Infrastructure..."
+          echo "========================================="
+          
+          # Apply Terraform
+          terraform apply -auto-approve \
+            -var="acr_name=$(ACR_NAME)" \
+            -var="aks_cluster_name=$(AKS_CLUSTER_NAME)" \
+            -var="resource_group_name=$(RESOURCE_GROUP_NAME)" \
+            -var="location=$(LOCATION)" \
+            -var="environment=$(ENVIRONMENT)" \
+            -var="vm_size=$(VM_SIZE)" \
+            -var="node_count=$(NODE_COUNT)" \
+            -var="kubernetes_version=$(KUBERNETES_VERSION)"
+          
+          echo "========================================="
+          echo "📝 Saving outputs to file..."
+          echo "========================================="
+          
+          # Get outputs and save to file
+          cd $(System.DefaultWorkingDirectory)
+          mkdir -p infra-outputs
+          cd terraform
+          
+          echo "ACR_LOGIN_SERVER=$(terraform output -raw acr_login_server)" > ../infra-outputs/vars.txt
+          echo "AKS_CLUSTER_NAME=$(terraform output -raw aks_cluster_name)" >> ../infra-outputs/vars.txt
+          echo "RESOURCE_GROUP=$(terraform output -raw resource_group_name)" >> ../infra-outputs/vars.txt
+          
+          echo "✅ Outputs saved:"
+          cat ../infra-outputs/vars.txt
+          echo "========================================="
+          echo "✅ Infrastructure Complete!"
+          echo "========================================="
+        name: InfraOutputs
+    
+    - task: PublishPipelineArtifact@1
+      displayName: '📎 Publish infrastructure outputs'
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/infra-outputs'
+        artifact: 'infra-vars'
+        publishLocation: 'pipeline'
+
+- stage: Deploy_Application
+  displayName: '🚀 Stage 2: Deploy Hello App'
+  dependsOn: Deploy_Infrastructure
+  condition: succeeded()
+  jobs:
+  - job: Build_And_Deploy
+    displayName: 'Build & Deploy Hello App'
+    pool:
+      name: 'Default'  # CHANGED TO DEFAULT
+    steps:
+    - checkout: self
+    
+    - task: DownloadPipelineArtifact@2
+      displayName: '📥 Download infrastructure outputs'
+      inputs:
+        artifact: 'infra-vars'
+        path: '$(Pipeline.Workspace)/infra-vars'
+    
+    - task: AzureCLI@2
+      displayName: '📦 Load infrastructure variables'
+      inputs:
+        azureSubscription: 'terraform-azure-wif'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "========================================="
+          echo "📦 Loading infrastructure outputs..."
+          echo "========================================="
+          
+          # Load variables from file
+          source $(Pipeline.Workspace)/infra-vars/vars.txt
+          
+          echo "✅ ACR Server: $ACR_LOGIN_SERVER"
+          echo "✅ AKS Cluster: $AKS_CLUSTER_NAME"
+          echo "✅ Resource Group: $RESOURCE_GROUP"
+          
+          # Set pipeline variables
+          echo "##vso[task.setvariable variable=acrServer]$ACR_LOGIN_SERVER"
+          echo "##vso[task.setvariable variable=aksCluster]$AKS_CLUSTER_NAME"
+          echo "##vso[task.setvariable variable=rgName]$RESOURCE_GROUP"
+    
+    - task: AzureCLI@2
+      displayName: '🐳 Build & Push to ACR'
+      inputs:
+        azureSubscription: 'terraform-azure-wif'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        workingDirectory: '$(System.DefaultWorkingDirectory)'
+        inlineScript: |
+          set -e
+          echo "========================================="
+          echo "🚀 Building and pushing to ACR"
+          echo "========================================="
+          echo "ACR Server: $(acrServer)"
+          echo "========================================="
+          
+          # Extract ACR name from login server
+          ACR_NAME=$(echo $(acrServer) | cut -d'.' -f1)
+          echo "ACR Name: $ACR_NAME"
+          
+          # Login to ACR
+          az acr login --name $ACR_NAME
+          
+          # Build Docker image
+          echo "🏗️ Building Docker image..."
+          docker build -t $(acrServer)/hello-app:$(Build.BuildId) .
+          
+          # Push to ACR
+          echo "📤 Pushing image to ACR..."
+          docker push $(acrServer)/hello-app:$(Build.BuildId)
+          
+          echo "✅ Image pushed: $(acrServer)/hello-app:$(Build.BuildId)"
+          echo "========================================="
+    
+    - task: AzureCLI@2
+      displayName: '☸️ Deploy to AKS'
+      inputs:
+        azureSubscription: 'terraform-azure-wif'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/manifests'
+        inlineScript: |
+          set -e
+          echo "========================================="
+          echo "🚀 Deploying to AKS"
+          echo "========================================="
+          echo "AKS Cluster: $(aksCluster)"
+          echo "Resource Group: $(rgName)"
+          echo "========================================="
+          
+          # Get AKS credentials
+          echo "🔑 Getting AKS credentials..."
+          az aks get-credentials --resource-group $(rgName) --name $(aksCluster) --overwrite-existing
+          
+          # Update deployment with correct image
+          echo "📝 Updating deployment image..."
+          sed -i "s|placeholder|$(acrServer)/hello-app:$(Build.BuildId)|g" deployment.yaml
+          
+          # Deploy to Kubernetes
+          echo "🚀 Applying Kubernetes manifests..."
+          kubectl apply -f deployment.yaml
+          kubectl apply -f service.yaml
+          
+          # Wait for rollout
+          echo "⏳ Waiting for deployment rollout..."
+          kubectl rollout status deployment/hello-app-deployment --timeout=180s
+          
+          # Get public IP
+          echo "🌐 Waiting for LoadBalancer IP..."
+          sleep 30
+          
+          APP_IP=$(kubectl get svc hello-app-service -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>/dev/null || echo "pending")
+          
+          echo "========================================="
+          echo "🎉 APPLICATION DEPLOYED!"
+          echo "========================================="
+          if [ "$APP_IP" != "pending" ] && [ ! -z "$APP_IP" ]; then
+            echo "🌍 Access your app at: http://$APP_IP"
+          else
+            echo "⏳ LoadBalancer IP still provisioning..."
+            echo "   Run: kubectl get svc hello-app-service"
+          fi
+          echo "========================================="
