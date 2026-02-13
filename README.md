@@ -1,5 +1,7 @@
 🚀 Azure AKS + ACR Deployment with Terraform & Azure DevOps
 Complete CI/CD Pipeline for Containerized Applications on Azure
+
+
 📋 Project Overview
 This project demonstrates a production-ready CI/CD pipeline that provisions Azure Kubernetes Service (AKS) and Azure Container Registry (ACR) using Terraform, then deploys a containerized Hello World application - all with a single click in Azure DevOps.
 
@@ -347,3 +349,4 @@ HashiCorp for Terraform
 Kubernetes Community
 Microsoft Learn Documentation
 Happy Cloud Deployments! 🚀☁️
+
